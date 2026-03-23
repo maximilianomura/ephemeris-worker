@@ -1,0 +1,13 @@
+// wrangler.jsonc
+{
+  "name": "ephemeris-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "minify": true,
+  "upload_source_maps": true,
+  // Serve swisseph.data + swisseph.wasm as static assets so the WASM loader can fetch them
+  "assets": {
+    "directory": "./public"
+  }
+}
