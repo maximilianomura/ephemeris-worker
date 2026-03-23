@@ -802,7 +802,7 @@ const UI_HTML = `<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>Swiss Ephemeris <span class="badge">AGPL-3.0</span></h1>
-  <p class="sub">Free natal chart API · <a href="https://github.com/yourusername/ephemeris-worker" target="_blank">Source on GitHub</a></p>
+  <p class="sub">Free natal chart API · <a href="https://github.com/maximilianomura/ephemeris-worker" target="_blank">Source on GitHub</a></p>
 
   <div class="card">
     <div class="row2" style="margin-top:0">
