@@ -3,3 +3,4 @@ node_modules/
 dist/
 .wrangler/
 *.log
+how to use the API.md

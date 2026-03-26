@@ -3,8 +3,8 @@ import { cors }           from 'hono/cors'
 import { authMiddleware } from './middleware/auth'
 import { calculateChart, type HouseSystem, type ZodiacType } from './lib/ephemeris'
 import { geocodeCity }    from './lib/geocode'
-import { lonToSign }      from './lib/astro'
-import { localizeChart, localizeDashas, localizeElectionalCriteria, localizeElectionalResults, localizeVocPeriods, localizeMoonPhases, localizePlanet, type Lang } from './lib/localize'
+import { lonToSign, calculateAspects, getHouse } from './lib/astro'
+import { localizeChart, localizeDashas, localizeElectionalCriteria, localizeElectionalResults, localizeVocPeriods, localizeMoonPhases, localizePlanet, localizeAspect, type Lang } from './lib/localize'
 // @ts-ignore — wrangler binds .wasm files as WebAssembly.Module
 import wasmModule from '../public/swisseph.wasm'
 
@@ -735,6 +735,407 @@ app.post('/api/electional', async (c) => {
       ok: true,
       criteria:       localizeElectionalCriteria(criteria, lang),
       favorableDates: localizeElectionalResults(deduplicated.slice(0, 30), lang),
+      lang,
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// ── 10. SOLAR RETURN ────────────────────────────────────────────────────────
+app.post('/api/solar-return', async (c) => {
+  try {
+    const body = await c.req.json() as {
+      date: string; time: string
+      city?: string; country?: string
+      lat?: number; lng?: number
+      utcOffset: number
+      targetYear: number
+      returnLat?: number; returnLng?: number
+      houseSystem?: HouseSystem
+      lang?: Lang
+    }
+
+    if (!body.date || !body.time || body.utcOffset === undefined) {
+      return c.json({ error: 'date, time and utcOffset are required' }, 400)
+    }
+    if (!body.targetYear || !Number.isInteger(body.targetYear)) {
+      return c.json({ error: 'targetYear is required (integer)' }, 400)
+    }
+
+    let lat: number, lng: number
+    if (body.lat !== undefined && body.lng !== undefined) {
+      lat = body.lat; lng = body.lng
+    } else if (body.city && body.country) {
+      const geo = await geocodeCity(body.city, body.country)
+      lat = geo.lat; lng = geo.lng
+    } else {
+      return c.json({ error: 'Provide either lat+lng or city+country' }, 400)
+    }
+
+    const returnLat = body.returnLat ?? lat
+    const returnLng = body.returnLng ?? lng
+
+    const [byr, bmo, bdy] = body.date.split('-').map(Number)
+    const [bhr, bmn]      = body.time.split(':').map(Number)
+    const birthUtHour     = (bhr + bmn / 60) - body.utcOffset
+
+    // @ts-ignore
+    const SwissEphModule = await import('./vendor/swisseph.js')
+    const SwissEph = (SwissEphModule as any).default ?? SwissEphModule
+    const swe = new SwissEph()
+    await swe.initSwissEph(wasmModule)
+
+    const birthJD     = swe.julday(byr, bmo, bdy, birthUtHour)
+    const natalSunLon = swe.calc_ut(birthJD, 0, 260)[0]  // Sun tropical longitude
+
+    // Normalize angle diff to (-180, 180] for bracket detection
+    const normDiff = (a: number, b: number): number => {
+      let d = ((a - b) % 360 + 360) % 360
+      if (d > 180) d -= 360
+      return d
+    }
+
+    // Search entire targetYear + 10 days into next year (handles Dec/Jan boundary)
+    const searchStart = swe.julday(body.targetYear, 1, 1, 0)
+    const searchEnd   = swe.julday(body.targetYear + 1, 1, 10, 0)
+
+    let returnJD: number | null = null
+    let prevDiff = normDiff(swe.calc_ut(searchStart, 0, 260)[0], natalSunLon)
+
+    for (let jd = searchStart + 1; jd <= searchEnd; jd += 1) {
+      const curDiff = normDiff(swe.calc_ut(jd, 0, 260)[0], natalSunLon)
+      if (prevDiff < 0 && curDiff >= 0) {
+        // Binary search within [jd-1, jd] to sub-minute precision
+        let lo = jd - 1, hi = jd
+        for (let iter = 0; iter < 50; iter++) {
+          const mid     = (lo + hi) / 2
+          const midDiff = normDiff(swe.calc_ut(mid, 0, 260)[0], natalSunLon)
+          if (Math.abs(midDiff) < 0.00001) { returnJD = mid; break }
+          if (midDiff < 0) lo = mid; else hi = mid
+        }
+        if (returnJD === null) returnJD = (lo + hi) / 2
+        break
+      }
+      prevDiff = curDiff
+    }
+
+    swe.close()
+
+    if (returnJD === null) {
+      return c.json({ error: `Could not find solar return in year ${body.targetYear}` }, 400)
+    }
+
+    const returnMs  = (returnJD - 2440587.5) * 86400000
+    const dt        = new Date(returnMs)
+    const returnDate = dt.toISOString().split('T')[0]!
+    const returnTime = dt.toISOString().split('T')[1]!.slice(0, 5) + ' UTC'
+    const rhr = dt.getUTCHours() + dt.getUTCMinutes() / 60 + dt.getUTCSeconds() / 3600
+
+    const lang: Lang = body.lang ?? 'en'
+    const returnChart = await calculateChart({
+      year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+      hour: rhr, lat: returnLat, lng: returnLng,
+      houseSystem: body.houseSystem, lang,
+    })
+
+    return c.json({
+      ok: true,
+      returnDate,
+      returnTime,
+      natalSun:    lonToSign(natalSunLon, lang),
+      returnChart: localizeChart(returnChart, lang),
+      lang,
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// ── 11. LUNAR RETURN ─────────────────────────────────────────────────────────
+app.post('/api/lunar-return', async (c) => {
+  try {
+    const body = await c.req.json() as {
+      date: string; time: string
+      city?: string; country?: string
+      lat?: number; lng?: number
+      utcOffset: number
+      targetMonth: string   // "YYYY-MM"
+      returnLat?: number; returnLng?: number
+      houseSystem?: HouseSystem
+      lang?: Lang
+    }
+
+    if (!body.date || !body.time || body.utcOffset === undefined) {
+      return c.json({ error: 'date, time and utcOffset are required' }, 400)
+    }
+    if (!body.targetMonth || !/^\d{4}-\d{2}$/.test(body.targetMonth)) {
+      return c.json({ error: 'targetMonth is required in YYYY-MM format' }, 400)
+    }
+
+    let lat: number, lng: number
+    if (body.lat !== undefined && body.lng !== undefined) {
+      lat = body.lat; lng = body.lng
+    } else if (body.city && body.country) {
+      const geo = await geocodeCity(body.city, body.country)
+      lat = geo.lat; lng = geo.lng
+    } else {
+      return c.json({ error: 'Provide either lat+lng or city+country' }, 400)
+    }
+
+    const returnLat = body.returnLat ?? lat
+    const returnLng = body.returnLng ?? lng
+
+    const [byr, bmo, bdy] = body.date.split('-').map(Number)
+    const [bhr, bmn]      = body.time.split(':').map(Number)
+    const birthUtHour     = (bhr + bmn / 60) - body.utcOffset
+
+    // @ts-ignore
+    const SwissEphModule = await import('./vendor/swisseph.js')
+    const SwissEph = (SwissEphModule as any).default ?? SwissEphModule
+    const swe = new SwissEph()
+    await swe.initSwissEph(wasmModule)
+
+    const birthJD      = swe.julday(byr, bmo, bdy, birthUtHour)
+    const natalMoonLon = swe.calc_ut(birthJD, 1, 260)[0]  // Moon tropical longitude
+
+    const [myr, mon] = body.targetMonth.split('-').map(Number)
+    const nextMon    = mon === 12 ? 1     : mon + 1
+    const nextYr     = mon === 12 ? myr + 1 : myr
+    // Search 2 days before month start → 5 days after month end (handles boundary returns)
+    const searchStart = swe.julday(myr, mon, 1, 0) - 2
+    const searchEnd   = swe.julday(nextYr, nextMon, 5, 0)
+
+    const normDiff = (a: number, b: number): number => {
+      let d = ((a - b) % 360 + 360) % 360
+      if (d > 180) d -= 360
+      return d
+    }
+
+    const stepJD = 2 / 24  // 2-hour steps — Moon moves ~1° per 2h, step < 1° so bracket is tight
+    let returnJD: number | null = null
+    let prevDiff = normDiff(swe.calc_ut(searchStart, 1, 260)[0], natalMoonLon)
+
+    for (let jd = searchStart + stepJD; jd <= searchEnd; jd += stepJD) {
+      const curDiff = normDiff(swe.calc_ut(jd, 1, 260)[0], natalMoonLon)
+      if (prevDiff < 0 && curDiff >= 0) {
+        let lo = jd - stepJD, hi = jd
+        for (let iter = 0; iter < 50; iter++) {
+          const mid     = (lo + hi) / 2
+          const midDiff = normDiff(swe.calc_ut(mid, 1, 260)[0], natalMoonLon)
+          if (Math.abs(midDiff) < 0.00001) { returnJD = mid; break }
+          if (midDiff < 0) lo = mid; else hi = mid
+        }
+        if (returnJD === null) returnJD = (lo + hi) / 2
+        break
+      }
+      prevDiff = curDiff
+    }
+
+    swe.close()
+
+    if (returnJD === null) {
+      return c.json({ error: `No lunar return found in ${body.targetMonth}` }, 400)
+    }
+
+    const returnMs   = (returnJD - 2440587.5) * 86400000
+    const dt         = new Date(returnMs)
+    const returnDate = dt.toISOString().split('T')[0]!
+    const returnTime = dt.toISOString().split('T')[1]!.slice(0, 5) + ' UTC'
+    const rhr = dt.getUTCHours() + dt.getUTCMinutes() / 60 + dt.getUTCSeconds() / 3600
+
+    const lang: Lang = body.lang ?? 'en'
+    const returnChart = await calculateChart({
+      year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+      hour: rhr, lat: returnLat, lng: returnLng,
+      houseSystem: body.houseSystem, lang,
+    })
+
+    return c.json({
+      ok: true,
+      returnDate,
+      returnTime,
+      natalMoon:   lonToSign(natalMoonLon, lang),
+      returnChart: localizeChart(returnChart, lang),
+      lang,
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// ── 12. SYNASTRY ─────────────────────────────────────────────────────────────
+app.post('/api/synastry', async (c) => {
+  try {
+    const body = await c.req.json() as {
+      person1: {
+        date: string; time: string; utcOffset: number
+        lat?: number; lng?: number; city?: string; country?: string
+      }
+      person2: {
+        date: string; time: string; utcOffset: number
+        lat?: number; lng?: number; city?: string; country?: string
+      }
+      houseSystem?: HouseSystem
+      lang?: Lang
+    }
+
+    if (!body.person1 || !body.person2) {
+      return c.json({ error: 'person1 and person2 are required' }, 400)
+    }
+
+    const lang: Lang       = body.lang ?? 'en'
+    const houseSystem      = body.houseSystem ?? 'P'
+    type PersonInput       = typeof body.person1
+
+    const resolveCoords = async (p: PersonInput): Promise<{ lat: number; lng: number }> => {
+      if (p.lat !== undefined && p.lng !== undefined) return { lat: p.lat, lng: p.lng }
+      if (p.city && p.country) {
+        const geo = await geocodeCity(p.city, p.country)
+        return { lat: geo.lat, lng: geo.lng }
+      }
+      throw new Error('Each person requires lat+lng or city+country')
+    }
+
+    const toUTHour = (time: string, utcOffset: number): number => {
+      const [h, m] = time.split(':').map(Number)
+      return (h + m / 60) - utcOffset
+    }
+
+    const [coords1, coords2] = await Promise.all([
+      resolveCoords(body.person1),
+      resolveCoords(body.person2),
+    ])
+
+    const [yr1, mo1, dy1] = body.person1.date.split('-').map(Number)
+    const [yr2, mo2, dy2] = body.person2.date.split('-').map(Number)
+
+    // Calculate both natal charts in parallel
+    const [chart1, chart2] = await Promise.all([
+      calculateChart({
+        year: yr1, month: mo1, day: dy1,
+        hour: toUTHour(body.person1.time, body.person1.utcOffset),
+        lat: coords1.lat, lng: coords1.lng, houseSystem, lang,
+      }),
+      calculateChart({
+        year: yr2, month: mo2, day: dy2,
+        hour: toUTHour(body.person2.time, body.person2.utcOffset),
+        lat: coords2.lat, lng: coords2.lng, houseSystem, lang,
+      }),
+    ])
+
+    // ── Cross-aspects (synastry orbs wider than natal) ──────────────────────
+    const SYNASTRY_ASPECTS = [
+      { name: 'Conjunction',  angle: 0,   orb: 8 },
+      { name: 'Opposition',   angle: 180, orb: 8 },
+      { name: 'Trine',        angle: 120, orb: 6 },
+      { name: 'Square',       angle: 90,  orb: 7 },
+      { name: 'Sextile',      angle: 60,  orb: 6 },
+      { name: 'Quincunx',     angle: 150, orb: 3 },
+      { name: 'Semi-sextile', angle: 30,  orb: 2 },
+    ]
+
+    const crossAspects: Array<{
+      planet1: string; planet2: string; type: string; orb: number; applying: boolean
+    }> = []
+
+    for (const p1 of chart1.planets) {
+      for (const p2 of chart2.planets) {
+        let diff = Math.abs(p1.longitude - p2.longitude)
+        if (diff > 180) diff = 360 - diff
+        for (const asp of SYNASTRY_ASPECTS) {
+          const orbVal = Math.abs(diff - asp.angle)
+          if (orbVal <= asp.orb) {
+            crossAspects.push({
+              planet1:  localizePlanet(p1.name, lang),
+              planet2:  localizePlanet(p2.name, lang),
+              type:     localizeAspect(asp.name, lang),
+              orb:      Math.round(orbVal * 100) / 100,
+              applying: p1.speed > 0 ? diff < asp.angle : diff > asp.angle,
+            })
+          }
+        }
+      }
+    }
+    crossAspects.sort((a, b) => a.orb - b.orb)
+
+    // ── Composite chart (midpoint method) ────────────────────────────────────
+    // Midpoint longitude using the shorter arc between two zodiac positions
+    const midpointLon = (a: number, b: number): number => {
+      const diff = Math.abs(a - b)
+      const mid  = (a + b) / 2
+      return diff > 180 ? (mid + 180) % 360 : mid
+    }
+
+    // Composite JD = midpoint of both birth JDs — used for house calculation
+    const compositeJD = (chart1.julianDay + chart2.julianDay) / 2
+
+    // Calculate composite house cusps at midpoint JD, person1's location
+    // @ts-ignore
+    const SwissEphModule2 = await import('./vendor/swisseph.js')
+    const SwissEph2 = (SwissEphModule2 as any).default ?? SwissEphModule2
+    const swe2 = new SwissEph2()
+    await swe2.initSwissEph(wasmModule)
+    const compHouseData = swe2.houses(compositeJD, coords1.lat, coords1.lng, houseSystem)
+    const compAscLon    = compHouseData.ascmc[0] as number
+    const compMcLon     = compHouseData.ascmc[1] as number
+    const compCusps     = Array.from(compHouseData.cusps as ArrayLike<number>).slice(1, 13) as number[]
+    swe2.close()
+
+    // Build composite planets from midpoint longitudes
+    const compPlanets = chart1.planets.map((p1, i) => {
+      const p2     = chart2.planets[i]!
+      const compLon = midpointLon(p1.longitude, p2.longitude)
+      return {
+        name:          p1.name,
+        nameLocalized: localizePlanet(p1.name, lang),
+        symbol:        p1.symbol,
+        longitude:     compLon,
+        latitude:      0,
+        speed:         (p1.speed + p2.speed) / 2,
+        retrograde:    false,
+        position:      lonToSign(compLon, lang),
+        house:         getHouse(compLon, compCusps),
+      }
+    })
+
+    const compHouses = compCusps.map((cusp, i) => ({
+      house:    i + 1,
+      cusp,
+      position: lonToSign(cusp, lang),
+    }))
+
+    const compAspects = calculateAspects(
+      compPlanets.map(p => ({ name: p.name, lon: p.longitude, speed: 0 }))
+    ).map(a => ({
+      ...a,
+      planet1: localizePlanet(a.planet1, lang),
+      planet2: localizePlanet(a.planet2, lang),
+      type:    localizeAspect(a.type, lang),
+    }))
+
+    const compositeChart = {
+      ascendant:  lonToSign(compAscLon, lang),
+      midheaven:  lonToSign(compMcLon, lang),
+      planets:    compPlanets,
+      houses:     compHouses,
+      aspects:    compAspects,
+      julianDay:  compositeJD,
+      meta: {
+        houseSystem,
+        zodiac:      'tropical',
+        lang,
+        method:      'midpoint',
+        calculatedAt: new Date().toISOString(),
+      },
+    }
+
+    return c.json({
+      ok:            true,
+      person1Chart:  localizeChart(chart1, lang),
+      person2Chart:  localizeChart(chart2, lang),
+      crossAspects,
+      compositeChart,
       lang,
     })
   } catch (err: any) {
