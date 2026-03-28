@@ -1143,6 +1143,102 @@ app.post('/api/synastry', async (c) => {
   }
 })
 
+// ── 12. TRANSITS — current sky snapshot for a given date ──────────────────────
+// Returns all 10 planets for noon UTC on `date`, with speeds and retrograde flags.
+// Also scans 120 days forward to find each planet's next direction-change station.
+// Used by daily-horoscope (today's sky vs natal) and mercury-retrograde reports.
+app.post('/api/transits', async (c) => {
+  try {
+    const body = await c.req.json() as { date: string; lang?: Lang }
+    if (!body.date) return c.json({ error: 'date is required' }, 400)
+
+    const parts = body.date.split('-').map(Number)
+    const [yr, mo, dy] = parts
+    if (!yr || !mo || !dy) return c.json({ error: 'invalid date — use YYYY-MM-DD' }, 400)
+
+    const utHour = 12 // noon UTC — standard reference for daily transits
+    const lang: Lang = body.lang ?? 'en'
+
+    // @ts-ignore
+    const SwissEphModule = await import('./vendor/swisseph.js')
+    const SwissEph = (SwissEphModule as any).default ?? SwissEphModule
+    const swe = new SwissEph()
+    await swe.initSwissEph(wasmModule)
+
+    const SEFLG_MOSEPH = 4
+    const SEFLG_SPEED  = 256
+    const flag = SEFLG_MOSEPH | SEFLG_SPEED
+
+    const PLANET_IDS: Array<{ id: number; key: string }> = [
+      { id: 0, key: 'Sun'     },
+      { id: 1, key: 'Moon'    },
+      { id: 2, key: 'Mercury' },
+      { id: 3, key: 'Venus'   },
+      { id: 4, key: 'Mars'    },
+      { id: 5, key: 'Jupiter' },
+      { id: 6, key: 'Saturn'  },
+      { id: 7, key: 'Uranus'  },
+      { id: 8, key: 'Neptune' },
+      { id: 9, key: 'Pluto'   },
+    ]
+
+    const jdNow = swe.julday(yr, mo, dy, utHour)
+
+    // Calculate each planet's position + speed
+    const planets: any[] = []
+    for (const { id, key } of PLANET_IDS) {
+      const pos = swe.calc_ut(jdNow, id, flag)
+      // pos = [lon, lat, dist, speed_lon, speed_lat, speed_dist]
+      const isRetrograde = pos[3] < 0
+      const lonPos = lonToSign(pos[0], lang)
+      planets.push({
+        key,
+        name:             localizePlanet(key, lang),
+        longitude:        Math.round(pos[0] * 10000) / 10000,
+        speed:            Math.round(pos[3] * 10000) / 10000,
+        retrograde:       isRetrograde,
+        position: {
+          sign:      lonPos.sign,         // always English key
+          formatted: lonPos.formatted,    // localized display string
+        },
+        retrogradeSymbol: isRetrograde ? '℞' : '',
+      })
+    }
+
+    // Scan forward up to 120 days for the next direction-change station per planet
+    type Station = { type: 'retrograde' | 'direct'; date: string; position: string }
+    const nextStation: Record<string, Station | null> = {}
+
+    for (const { id, key } of PLANET_IDS) {
+      if (key === 'Sun' || key === 'Moon') {
+        nextStation[key] = null  // no retrograde stations
+        continue
+      }
+      const currentRetro = swe.calc_ut(jdNow, id, flag)[3] < 0
+      let found: Station | null = null
+      for (let d = 1; d <= 120; d++) {
+        const jdScan = jdNow + d
+        const posScan = swe.calc_ut(jdScan, id, flag)
+        if ((posScan[3] < 0) !== currentRetro) {
+          const ms = (jdScan - 2440587.5) * 86400000
+          found = {
+            type:     posScan[3] < 0 ? 'retrograde' : 'direct',
+            date:     new Date(ms).toISOString().split('T')[0]!,
+            position: lonToSign(posScan[0], lang).formatted,
+          }
+          break
+        }
+      }
+      nextStation[key] = found
+    }
+
+    swe.close()
+    return c.json({ ok: true, date: body.date, planets, nextStation, lang })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
 export default app
 
 // ── Inline UI ─────────────────────────────────────────────────────────────────
